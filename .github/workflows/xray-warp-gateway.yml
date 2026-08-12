@@ -281,7 +281,7 @@ jobs:
           test -n "$TUNNEL_TOKEN"
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
-          nohup ~/cloudflared/cloudflared tunnel run > ~/cloudflared.log 2>&1 &
+          nohup ~/cloudflared/cloudflared tunnel --metrics 127.0.0.1:60123 run > ~/cloudflared.log 2>&1 &
           echo "✅ Cloudflare Tunnel started"
 
       # ---------- Run monitor ----------
@@ -302,11 +302,12 @@ jobs:
             while read -r -u "${CF[0]}" line; do
               if [[ "$line" =~ https://[a-zA-Z0-9.-]+\.trycloudflare\.com ]]; then
                 XRAY_SERVER="${BASH_REMATCH[0]#https://}"
+                kill "$CF_PID" 2>/dev/null || true
                 break
               fi
               if (( SECONDS >= deadline )); then
                 kill "$CF_PID" 2>/dev/null || true
-                exit 1
+                break
               fi
             done
           fi
@@ -329,6 +330,30 @@ jobs:
               expire_timestamp: $expire,
               node: $node
             }' > ~/www/api/gateway.json
+          echo "⏳ Waiting for services to be ready (max 120s)..."
+          TOTAL_WAIT=120
+          CHECK_INTERVAL=2
+          ELAPSED=0
+          wait_for() {
+            local description="$1"
+            local cmd="$2"
+            local start_time=$SECONDS
+            while ! eval "$cmd" 2>/dev/null; do
+              if (( SECONDS - start_time >= TOTAL_WAIT )); then
+                echo "⚠️ $description not ready within total timeout, continuing anyway"
+                return 1
+              fi
+              sleep $CHECK_INTERVAL
+            done
+            echo "✅ $description ready"
+            return 0
+          }
+          wait_for "Xray" "nc -z 127.0.0.1 25392"
+          wait_for "Caddy" "curl -s -f -m 2 http://127.0.0.1:8080/api/gateway.json >/dev/null"
+          if [ -n "$TUNNEL_TOKEN" ]; then
+            wait_for "Cloudflare Tunnel" "curl -s --max-time 2 http://127.0.0.1:60123/metrics | grep -q '^cloudflared_tunnel_ha_connections [1-9]'"
+          fi
+          echo "✅ Services ready (or timeout exceeded), proceeding..."
           if [ -n "${CONTROLLER_URL}" ] && [ -n "${GH_TOKEN}" ]; then
             echo "🔔 Notifying controller: node ${NODE_ID} is online (run ${RUN_ID})..."
             curl -X POST "${CONTROLLER_URL}/node/online" \
